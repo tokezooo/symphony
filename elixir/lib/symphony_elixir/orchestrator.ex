@@ -467,24 +467,35 @@ defmodule SymphonyElixir.Orchestrator do
   defp restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
     elapsed_ms = stall_elapsed_ms(running_entry, now)
 
-    if is_integer(elapsed_ms) and elapsed_ms > timeout_ms do
-      identifier = Map.get(running_entry, :identifier, issue_id)
-      session_id = running_entry_session_id(running_entry)
+    cond do
+      not codex_session_started?(running_entry) ->
+        state
 
-      Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+      is_integer(elapsed_ms) and elapsed_ms > timeout_ms ->
+        identifier = Map.get(running_entry, :identifier, issue_id)
+        session_id = running_entry_session_id(running_entry)
 
-      next_attempt = next_retry_attempt_from_running(running_entry)
+        Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
 
-      state
-      |> terminate_running_issue(issue_id, false)
-      |> schedule_issue_retry(issue_id, next_attempt, %{
-        identifier: identifier,
-        error: "stalled for #{elapsed_ms}ms without codex activity"
-      })
-    else
-      state
+        next_attempt = next_retry_attempt_from_running(running_entry)
+
+        state
+        |> terminate_running_issue(issue_id, false)
+        |> schedule_issue_retry(issue_id, next_attempt, %{
+          identifier: identifier,
+          error: "stalled for #{elapsed_ms}ms without codex activity"
+        })
+
+      true ->
+        state
     end
   end
+
+  defp codex_session_started?(running_entry) when is_map(running_entry) do
+    is_binary(Map.get(running_entry, :session_id))
+  end
+
+  defp codex_session_started?(_running_entry), do: false
 
   defp stall_elapsed_ms(running_entry, now) do
     running_entry

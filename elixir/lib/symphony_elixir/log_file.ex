@@ -22,11 +22,24 @@ defmodule SymphonyElixir.LogFile do
 
   @spec configure() :: :ok
   def configure do
+    if disabled?() do
+      Logger.info("Symphony rotating disk log handler disabled by SYMPHONY_DISABLE_DISK_LOG")
+      :ok
+    else
+      configure_disk_log()
+    end
+  end
+
+  defp configure_disk_log do
     log_file = Application.get_env(:symphony_elixir, :log_file, default_log_file())
     max_bytes = Application.get_env(:symphony_elixir, :log_file_max_bytes, @default_max_bytes)
     max_files = Application.get_env(:symphony_elixir, :log_file_max_files, @default_max_files)
 
     setup_disk_handler(log_file, max_bytes, max_files)
+  end
+
+  defp disabled? do
+    System.get_env("SYMPHONY_DISABLE_DISK_LOG") in ["1", "true", "TRUE", "yes", "YES"]
   end
 
   defp setup_disk_handler(log_file, max_bytes, max_files) do
