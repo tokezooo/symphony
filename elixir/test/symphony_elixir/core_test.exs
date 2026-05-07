@@ -812,6 +812,111 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "updated=2026-02-26T18:07:03Z"
   end
 
+  test "prompt builder uses non-empty workspace prompt override when configured" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prompt-override-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(Path.join(workspace, ".symphony/log"))
+      override_path = Path.join(workspace, ".symphony/log/codex-review-prompt.md")
+      File.write!(override_path, "Review-only prompt\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        prompt: "Workflow prompt for {{ issue.identifier }}",
+        codex_prompt_override_path: ".symphony/log/codex-review-prompt.md"
+      )
+
+      issue = %Issue{
+        identifier: "MT-702",
+        title: "Override prompt",
+        description: "Use a short review prompt",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-702",
+        labels: []
+      }
+
+      assert PromptBuilder.build_prompt(issue, workspace: workspace) == "Review-only prompt\n"
+    after
+      File.rm_rf(workspace)
+    end
+  end
+
+  test "prompt builder falls back when workspace prompt override is missing or empty" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prompt-override-missing-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(Path.join(workspace, ".symphony/log"))
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        prompt: "Workflow prompt for {{ issue.identifier }}",
+        codex_prompt_override_path: ".symphony/log/codex-review-prompt.md"
+      )
+
+      issue = %Issue{
+        identifier: "MT-703",
+        title: "Missing override",
+        description: "Use workflow prompt",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-703",
+        labels: []
+      }
+
+      assert PromptBuilder.build_prompt(issue, workspace: workspace) == "Workflow prompt for MT-703"
+
+      File.write!(Path.join(workspace, ".symphony/log/codex-review-prompt.md"), "   \n")
+      assert PromptBuilder.build_prompt(issue, workspace: workspace) == "Workflow prompt for MT-703"
+    after
+      File.rm_rf(workspace)
+    end
+  end
+
+  test "prompt builder rejects prompt override paths outside the workspace" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prompt-override-escape-#{System.unique_integer([:positive])}"
+      )
+
+    outside =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-prompt-override-outside-#{System.unique_integer([:positive])}.md"
+      )
+
+    try do
+      File.mkdir_p!(workspace)
+      File.write!(outside, "outside\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        prompt: "Workflow prompt",
+        codex_prompt_override_path: outside
+      )
+
+      issue = %Issue{
+        identifier: "MT-704",
+        title: "Outside override",
+        description: "Reject escape",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-704",
+        labels: []
+      }
+
+      assert_raise RuntimeError, ~r/prompt_override_outside_workspace/, fn ->
+        PromptBuilder.build_prompt(issue, workspace: workspace)
+      end
+    after
+      File.rm_rf(workspace)
+      File.rm(outside)
+    end
+  end
+
   test "prompt builder normalizes nested date-like values, maps, and structs in issue fields" do
     write_workflow_file!(Workflow.workflow_file_path(), prompt: "Ticket {{ issue.identifier }}")
 
@@ -1056,7 +1161,14 @@ defmodule SymphonyElixir.CoreTest do
       }
 
       before = MapSet.new(File.ls!(workspace_root))
-      assert :ok = AgentRunner.run(issue)
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 nil,
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+               )
+
       entries_after = MapSet.new(File.ls!(workspace_root))
 
       created =
@@ -1071,6 +1183,165 @@ defmodule SymphonyElixir.CoreTest do
       workspace = Path.join(workspace_root, workspace_name)
       assert File.exists?(workspace)
       assert File.exists?(Path.join(workspace, "README.md"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner runs after_run hook after token budget termination" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-budget-after-run-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      after_run_capture = Path.join(test_root, "after-run-outcome.json")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-budget"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-budget"}}}'
+            printf '%s\\n' '{"method":"codex/event/token_count","params":{"msg":{"payload":{"info":{"total_token_usage":{"input_tokens":7,"output_tokens":5,"total_tokens":12}}}}}}'
+            ;;
+          *)
+            sleep 1
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_turn_token_budget: 10,
+        hook_after_run: "cp .symphony/log/agent-outcome.json #{after_run_capture}"
+      )
+
+      issue = %Issue{
+        id: "issue-budget-after-run",
+        identifier: "MT-731",
+        title: "Budget after run",
+        description: "after_run reads budget outcome",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-731",
+        labels: []
+      }
+
+      assert_raise RuntimeError, ~r/turn_token_budget_exceeded/, fn ->
+        AgentRunner.run(issue)
+      end
+
+      outcome = after_run_capture |> File.read!() |> Jason.decode!()
+      assert outcome["reason"] == "turn_token_budget_exceeded"
+      assert outcome["total_tokens"] == 12
+      assert outcome["token_budget"] == 10
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner sends workspace prompt override to codex first turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-prompt-override-#{System.unique_integer([:positive])}"
+      )
+
+    previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+    on_exit(fn ->
+      restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-override"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-override"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_prompt_override_path: ".symphony/log/codex-review-prompt.md",
+        hook_after_create: "mkdir -p .symphony/log && printf 'Short review prompt\\n' > .symphony/log/codex-review-prompt.md",
+        prompt: "Full workflow prompt {{ issue.description }}"
+      )
+
+      issue = %Issue{
+        id: "issue-prompt-override",
+        identifier: "MT-732",
+        title: "Prompt override",
+        description: "Long Linear description that must not reach Codex",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-732",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 nil,
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+               )
+
+      turn_prompt =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.find(&(&1["method"] == "turn/start"))
+        |> get_in(["params", "input", Access.at(0), "text"])
+
+      assert turn_prompt == "Short review prompt\n"
+      refute turn_prompt =~ "Long Linear description"
     after
       File.rm_rf(test_root)
     end

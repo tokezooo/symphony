@@ -90,7 +90,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt = build_turn_prompt(issue, opts, workspace, turn_number, max_turns)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
@@ -130,9 +130,12 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, workspace, 1, _max_turns) do
+    issue
+    |> PromptBuilder.build_prompt(Keyword.put(opts, :workspace, workspace))
+  end
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+  defp build_turn_prompt(_issue, _opts, _workspace, turn_number, max_turns) do
     """
     Continuation guidance:
 

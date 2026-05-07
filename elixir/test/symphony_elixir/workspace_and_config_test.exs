@@ -733,6 +733,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       codex_turn_timeout_ms: nil,
       codex_read_timeout_ms: nil,
       codex_stall_timeout_ms: nil,
+      codex_prompt_override_path: nil,
+      codex_turn_token_budget: nil,
       tracker_api_token: nil,
       tracker_project_slug: nil
     )
@@ -771,6 +773,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.turn_timeout_ms == 3_600_000
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
+    assert config.codex.prompt_override_path == nil
+    assert config.codex.turn_token_budget == nil
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
@@ -833,6 +837,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.stall_timeout_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_turn_token_budget: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.turn_token_budget"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},

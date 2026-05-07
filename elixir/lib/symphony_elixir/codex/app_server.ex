@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @agent_outcome_path Path.join([".symphony", "log", "agent-outcome.json"])
 
   @type session :: %{
           port: port(),
@@ -104,7 +105,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, workspace, on_message, tool_executor, auto_approve_requests) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -326,22 +327,23 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, workspace, on_message, tool_executor, auto_approve_requests) do
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      token_budget_state(workspace)
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, token_budget) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, token_budget)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -350,7 +352,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          token_budget
         )
 
       {^port, {:exit_status, status}} ->
@@ -361,63 +364,40 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, token_budget) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
-      {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
-
-      {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
-        emit_turn_event(
-          on_message,
-          :turn_failed,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
-
-        {:error, {:turn_failed, Map.get(payload, "params")}}
-
-      {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
-        emit_turn_event(
-          on_message,
-          :turn_cancelled,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
-
-        {:error, {:turn_cancelled, Map.get(payload, "params")}}
-
-      {:ok, %{"method" => method} = payload}
-      when is_binary(method) ->
-        handle_turn_method(
-          port,
-          on_message,
-          payload,
-          payload_string,
-          method,
-          timeout_ms,
-          tool_executor,
-          auto_approve_requests
-        )
-
       {:ok, payload} ->
-        emit_message(
-          on_message,
-          :other_message,
-          %{
-            payload: payload,
-            raw: payload_string
-          },
-          metadata_from_message(port, payload)
-        )
+        case check_token_budget(payload, token_budget) do
+          {:halt, reason} ->
+            write_agent_outcome(Map.get(reason, :workspace), reason)
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+            emit_message(
+              on_message,
+              :turn_token_budget_exceeded,
+              %{
+                payload: payload,
+                raw: payload_string,
+                reason: reason
+              },
+              metadata_from_message(port, payload)
+            )
+
+            {:error, {:turn_token_budget_exceeded, Map.delete(reason, :workspace)}}
+
+          {:cont, updated_budget} ->
+            handle_decoded_payload(
+              port,
+              on_message,
+              payload,
+              payload_string,
+              timeout_ms,
+              tool_executor,
+              auto_approve_requests,
+              updated_budget
+            )
+        end
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -434,8 +414,68 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, token_budget)
     end
+  end
+
+  defp handle_decoded_payload(port, on_message, %{"method" => "turn/completed"} = payload, payload_string, _timeout_ms, _tool_executor, _auto_approve_requests, _token_budget) do
+    emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+    {:ok, :turn_completed}
+  end
+
+  defp handle_decoded_payload(port, on_message, %{"method" => "turn/failed", "params" => _} = payload, payload_string, _timeout_ms, _tool_executor, _auto_approve_requests, _token_budget) do
+    emit_turn_event(
+      on_message,
+      :turn_failed,
+      payload,
+      payload_string,
+      port,
+      Map.get(payload, "params")
+    )
+
+    {:error, {:turn_failed, Map.get(payload, "params")}}
+  end
+
+  defp handle_decoded_payload(port, on_message, %{"method" => "turn/cancelled", "params" => _} = payload, payload_string, _timeout_ms, _tool_executor, _auto_approve_requests, _token_budget) do
+    emit_turn_event(
+      on_message,
+      :turn_cancelled,
+      payload,
+      payload_string,
+      port,
+      Map.get(payload, "params")
+    )
+
+    {:error, {:turn_cancelled, Map.get(payload, "params")}}
+  end
+
+  defp handle_decoded_payload(port, on_message, %{"method" => method} = payload, payload_string, timeout_ms, tool_executor, auto_approve_requests, token_budget)
+       when is_binary(method) do
+    handle_turn_method(
+      port,
+      on_message,
+      payload,
+      payload_string,
+      method,
+      timeout_ms,
+      tool_executor,
+      auto_approve_requests,
+      token_budget
+    )
+  end
+
+  defp handle_decoded_payload(port, on_message, payload, payload_string, timeout_ms, tool_executor, auto_approve_requests, token_budget) do
+    emit_message(
+      on_message,
+      :other_message,
+      %{
+        payload: payload,
+        raw: payload_string
+      },
+      metadata_from_message(port, payload)
+    )
+
+    receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, token_budget)
   end
 
   defp emit_turn_event(on_message, event, payload, payload_string, port, payload_details) do
@@ -459,7 +499,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          method,
          timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         token_budget
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -484,7 +525,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, token_budget)
 
       :approval_required ->
         emit_message(
@@ -518,7 +559,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, token_budget)
         end
     end
   end
@@ -680,6 +721,130 @@ defmodule SymphonyElixir.Codex.AppServer do
        ) do
     :unhandled
   end
+
+  defp token_budget_state(workspace) do
+    case Config.settings!().codex.turn_token_budget do
+      limit when is_integer(limit) and limit > 0 ->
+        %{limit: limit, total_tokens: 0, workspace: workspace}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp check_token_budget(_payload, nil), do: {:cont, nil}
+
+  defp check_token_budget(payload, %{limit: limit, total_tokens: previous_total} = budget) do
+    total_tokens =
+      case token_total_from_payload(payload) do
+        total when is_integer(total) -> max(previous_total, total)
+        _ -> previous_total
+      end
+
+    updated_budget = %{budget | total_tokens: total_tokens}
+
+    if total_tokens >= limit do
+      {:halt,
+       %{
+         outcome: "error",
+         reason: "turn_token_budget_exceeded",
+         total_tokens: total_tokens,
+         token_budget: limit,
+         workspace: Map.get(budget, :workspace)
+       }}
+    else
+      {:cont, updated_budget}
+    end
+  end
+
+  defp write_agent_outcome(workspace, payload) when is_binary(workspace) do
+    path = Path.join(workspace, @agent_outcome_path)
+
+    body =
+      payload
+      |> Map.drop([:workspace])
+      |> Map.put(:written_at, DateTime.utc_now() |> DateTime.to_iso8601())
+      |> Jason.encode!(pretty: true)
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- File.write(path, body <> "\n") do
+      :ok
+    else
+      {:error, reason} ->
+        Logger.warning("Unable to write Codex outcome marker path=#{path} reason=#{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp write_agent_outcome(_workspace, _payload), do: :ok
+
+  defp token_total_from_payload(payload) when is_map(payload) do
+    paths = [
+      ["params", "tokenUsage", "total"],
+      ["tokenUsage", "total"],
+      ["params", "msg", "payload", "info", "total_token_usage"],
+      ["params", "msg", "info", "total_token_usage"],
+      ["params", "usage"],
+      ["usage"]
+    ]
+
+    paths
+    |> Enum.find_value(fn path ->
+      payload
+      |> map_at_path(path)
+      |> total_tokens_from_usage()
+    end)
+  end
+
+  defp token_total_from_payload(_payload), do: nil
+
+  defp total_tokens_from_usage(usage) when is_map(usage) do
+    integer_value(usage, [
+      "total_tokens",
+      :total_tokens,
+      "total",
+      :total,
+      "totalTokens",
+      :totalTokens
+    ])
+  end
+
+  defp total_tokens_from_usage(_usage), do: nil
+
+  defp map_at_path(payload, path) when is_map(payload) and is_list(path) do
+    Enum.reduce_while(path, payload, fn key, acc ->
+      cond do
+        is_map(acc) and Map.has_key?(acc, key) ->
+          {:cont, Map.get(acc, key)}
+
+        true ->
+          {:halt, nil}
+      end
+    end)
+  end
+
+  defp map_at_path(_payload, _path), do: nil
+
+  defp integer_value(payload, keys) when is_map(payload) and is_list(keys) do
+    Enum.find_value(keys, &map_integer_value(payload, &1))
+  end
+
+  defp map_integer_value(payload, key) when is_map(payload) do
+    payload
+    |> Map.get(key)
+    |> integer_like()
+  end
+
+  defp integer_like(value) when is_integer(value) and value >= 0, do: value
+
+  defp integer_like(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} when integer >= 0 -> integer
+      _ -> nil
+    end
+  end
+
+  defp integer_like(_value), do: nil
 
   defp normalize_dynamic_tool_result(%{"success" => success} = result) when is_boolean(success) do
     output =
