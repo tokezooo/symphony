@@ -505,6 +505,9 @@ defmodule SymphonyElixir.Orchestrator do
       not codex_session_started?(running_entry) ->
         state
 
+      codex_turn_finished?(running_entry) ->
+        state
+
       is_integer(elapsed_ms) and elapsed_ms > timeout_ms ->
         identifier = Map.get(running_entry, :identifier, issue_id)
         session_id = running_entry_session_id(running_entry)
@@ -530,6 +533,40 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp codex_session_started?(_running_entry), do: false
+
+  defp codex_turn_finished?(running_entry) when is_map(running_entry) do
+    terminal_codex_event?(Map.get(running_entry, :last_codex_event)) or
+      terminal_codex_method?(codex_message_method(Map.get(running_entry, :last_codex_message)))
+  end
+
+  defp codex_turn_finished?(_running_entry), do: false
+
+  defp terminal_codex_event?(event)
+       when event in [
+              :turn_completed,
+              "turn_completed",
+              :turn_failed,
+              "turn_failed",
+              :turn_cancelled,
+              "turn_cancelled"
+            ],
+       do: true
+
+  defp terminal_codex_event?(_event), do: false
+
+  defp terminal_codex_method?(method)
+       when method in ["turn/completed", "turn/failed", "turn/cancelled"],
+       do: true
+
+  defp terminal_codex_method?(_method), do: false
+
+  defp codex_message_method(%{message: message}), do: codex_message_method(message)
+  defp codex_message_method(%{"message" => message}), do: codex_message_method(message)
+  defp codex_message_method(%{method: method}) when is_binary(method), do: method
+  defp codex_message_method(%{"method" => method}) when is_binary(method), do: method
+  defp codex_message_method(%{payload: payload}), do: codex_message_method(payload)
+  defp codex_message_method(%{"payload" => payload}), do: codex_message_method(payload)
+  defp codex_message_method(_message), do: nil
 
   defp stall_elapsed_ms(running_entry, now) do
     running_entry
