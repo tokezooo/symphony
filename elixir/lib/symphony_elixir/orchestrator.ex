@@ -144,16 +144,32 @@ defmodule SymphonyElixir.Orchestrator do
               })
 
             _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; checking retry eligibility")
 
               next_attempt = next_retry_attempt_from_running(running_entry)
 
-              schedule_issue_retry(state, issue_id, next_attempt, %{
+              retry_metadata = %{
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path)
-              })
+              }
+
+              case abnormal_exit_retry_candidate(issue_id) do
+                :retry ->
+                  schedule_issue_retry(state, issue_id, next_attempt, retry_metadata)
+
+                {:release, %Issue{} = refreshed_issue} ->
+                  Logger.info(
+                    "Issue left retryable active states after abnormal worker exit: issue_id=#{issue_id} issue_identifier=#{refreshed_issue.identifier} state=#{refreshed_issue.state}; releasing claim"
+                  )
+
+                  release_issue_claim(state, issue_id)
+
+                :release ->
+                  Logger.info("Issue no longer visible after abnormal worker exit: issue_id=#{issue_id}; releasing claim")
+                  release_issue_claim(state, issue_id)
+              end
           end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
@@ -220,6 +236,24 @@ defmodule SymphonyElixir.Orchestrator do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
   end
+
+  defp abnormal_exit_retry_candidate(issue_id) when is_binary(issue_id) do
+    terminal_states = terminal_state_set()
+
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{} = issue | _]} ->
+        if retry_candidate_issue?(issue, terminal_states), do: :retry, else: {:release, issue}
+
+      {:ok, []} ->
+        :release
+
+      {:error, reason} ->
+        Logger.warning("Could not refresh issue after abnormal worker exit issue_id=#{issue_id}: #{inspect(reason)}; keeping retry")
+        :retry
+    end
+  end
+
+  defp abnormal_exit_retry_candidate(_issue_id), do: :retry
 
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
